@@ -1,10 +1,7 @@
 #!/bin/bash
-
 # System Details Report Script
 # Collects comprehensive system information
-
 OUTPUT_FILE="system_report_$(date +%Y%m%d_%H%M%S).txt"
-
 echo "Generating system report..."
 echo "================================" > "$OUTPUT_FILE"
 echo "SYSTEM INFORMATION REPORT" >> "$OUTPUT_FILE"
