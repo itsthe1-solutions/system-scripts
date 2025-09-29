@@ -1,23 +1,36 @@
 #!/bin/bash
-# Minimal script to install Tailscale and auto-join Headscale
+# Auto-install Tailscale and join Headscale
+# Can be run as normal user; escalates with sudo where needed
 
 set -e
 
 # === CONFIG ===
-HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Your Headscale URL
+HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Headscale URL
 AUTH_KEY="dd420b986128f3742384a0546d36d3ba9758b73ec3f37872"  # Pre-auth key
 
+# Function to run commands with sudo if not root
+run_sudo() {
+    if [ "$EUID" -ne 0 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
 echo "[*] Installing Tailscale..."
-curl -fsSL https://tailscale.com/install.sh | sh
+curl -fsSL https://tailscale.com/install.sh | run_sudo sh
 
 echo "[*] Enabling and starting tailscaled..."
-systemctl enable --now tailscaled
+run_sudo systemctl enable --now tailscaled
+
+echo "[*] Waiting a few seconds for tailscaled to start..."
+sleep 3
 
 echo "[*] Connecting to Headscale server..."
-tailscale up \
-  --login-server=$HEADSCALE_SERVER \
-  --auth-key=$AUTH_KEY \
-  --accept-dns=true \
+run_sudo tailscale up \
+    --login-server=$HEADSCALE_SERVER \
+    --auth-key=$AUTH_KEY \
+    --accept-dns=true \
 
 echo "[✔] Tailscale installed and connected!"
 tailscale status
