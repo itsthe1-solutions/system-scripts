@@ -16,7 +16,7 @@ systemctl enable --now tailscaled
 echo "[*] Connecting to Headscale server..."
 tailscale up \
   --login-server=$HEADSCALE_SERVER \
-  --authkey=$AUTH_KEY \
+  --auth-key=$AUTH_KEY \
   --accept-dns=true \
 
 echo "[✔] Tailscale installed and connected!"
