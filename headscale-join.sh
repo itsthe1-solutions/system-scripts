@@ -1,28 +1,42 @@
 #!/bin/bash
-# Script to auto-install Tailscale and join Headscale
-# Usage: sudo ./headscale-join.sh
+# Auto install and join Headscale with pre-auth key
+# Usage: curl -fsSL https://yourdomain.com/headscale-auto-install.sh | sudo bash
+
+set -e
 
 # === CONFIG ===
-HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Replace with your Headscale URL
-AUTH_KEY="dd420b986128f3742384a0546d36d3ba9758b73ec3f37872"  # Replace with your pre-generated key
+HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Your Headscale server
+AUTH_KEY="dd420b986128f3742384a0546d36d3ba9758b73ec3f37872"  # Pre-auth key
+TAILSCALE_VERSION="1.78.1"   # Lock version (optional)
+
+echo "[*] Updating system packages..."
+apt-get update -y
+
+echo "[*] Installing required dependencies..."
+apt-get install -y curl gnupg lsb-release
 
 # === INSTALL TAILSCALE ===
-echo "[*] Installing Tailscale..."
-if ! command -v tailscale &> /dev/null; then
-    curl -fsSL https://tailscale.com/install.sh | sh
+if ! command -v tailscale &>/dev/null; then
+    echo "[*] Installing Tailscale v${TAILSCALE_VERSION}..."
+    curl -fsSL https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_amd64.deb -o /tmp/tailscale.deb
+    apt-get install -y /tmp/tailscale.deb
+else
+    echo "[*] Tailscale already installed, skipping."
 fi
 
-# === ENABLE & START TAILSCALED ===
-echo "[*] Enabling service..."
+echo "[*] Enabling and starting tailscaled..."
 systemctl enable --now tailscaled
 
 # === CONNECT TO HEADSCALE ===
 echo "[*] Connecting to Headscale server: $HEADSCALE_SERVER"
 tailscale up \
-  --login-server=$HEADSCALE_SERVER \
-  --auth-key=$AUTH_KEY \
+  --login-server=${HEADSCALE_SERVER} \
+  --authkey=${AUTH_KEY} \
   --accept-dns=true \
+  --accept-routes=true
 
-# === SHOW STATUS ===
-echo "[*] Connection status:"
-tailscale status
+# === VERIFY ===
+echo "[*] Tailscale status:"
+tailscale status || true
+
+echo "[✔] Node successfully connected to Headscale!"
