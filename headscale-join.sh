@@ -5,7 +5,6 @@
 # === CONFIG ===
 HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Replace with your Headscale URL
 AUTH_KEY="dd420b986128f3742384a0546d36d3ba9758b73ec3f37872"  # Replace with your pre-generated key
-TS_PACKAGE_URL="https://pkgs.tailscale.com/stable/tailscale_1.78.1_amd64.tgz"
 
 # === INSTALL TAILSCALE ===
 echo "[*] Installing Tailscale..."
