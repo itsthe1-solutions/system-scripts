@@ -6,7 +6,7 @@ set -e
 
 # === CONFIG ===
 HEADSCALE_SERVER="https://hs.itsdemo1.xyz"   # Headscale URL
-AUTH_KEY="dd420b986128f3742384a0546d36d3ba9758b73ec3f37872"  # Pre-auth key
+AUTH_KEY="9fc35bff0ffed458b43eb2fc22850b98a7850a2fc634ef0f"  # Pre-auth key
 
 # Function to run commands with sudo if not root
 run_sudo() {
