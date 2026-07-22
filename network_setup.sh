@@ -480,7 +480,9 @@ configure_tailscale() {
 
     systemctl enable --now tailscaled >/dev/null 2>&1
 
-    read -rsp "Paste your Tailscale auth key (input hidden): " authkey
+    read -rp "Login server URL (blank = default Tailscale, or your Headscale URL e.g. https://hs.itsdemo1.xyz): " loginserver
+
+    read -rsp "Paste your auth key (input hidden): " authkey
     echo
     if [[ -z "$authkey" ]]; then
         echo "No key entered, cancelling."
@@ -488,16 +490,21 @@ configure_tailscale() {
         return
     fi
 
+    local base_args=(--authkey="$authkey" --accept-dns=false)
+    if [[ -n "$loginserver" ]]; then
+        base_args+=(--login-server="$loginserver")
+    fi
+
     read -rp "Advertise this box as an exit node/subnet router? (y/N): " adv
     if [[ "$adv" =~ ^[Yy]$ ]]; then
         read -rp "Subnet(s) to advertise, comma-separated (blank for none): " routes
         if [[ -n "$routes" ]]; then
-            tailscale up --authkey="$authkey" --advertise-routes="$routes" --accept-dns=false
+            tailscale up "${base_args[@]}" --advertise-routes="$routes"
         else
-            tailscale up --authkey="$authkey" --advertise-exit-node --accept-dns=false
+            tailscale up "${base_args[@]}" --advertise-exit-node
         fi
     else
-        tailscale up --authkey="$authkey" --accept-dns=false
+        tailscale up "${base_args[@]}"
     fi
 
     unset authkey
