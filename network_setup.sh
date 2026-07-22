@@ -1,478 +1,680 @@
 #!/bin/bash
-set -euo pipefail
+# ============================================================
+# netadmin-menu.sh
+# Ubuntu network admin helper menu
+#   1) Netplan: set interface to DHCP or Static
+#   2) Enable IP forwarding + NAT (share internet WAN -> LAN)
+#   3) Open SSH for password login, no key required (ITS The1 Solutions banner)
+#   4) LAN DHCP server (isc-dhcp-server)
+#   5) UFW firewall + fail2ban
+#   6) Port-forward / DNAT helper
+#   7) Tailscale install + connect (own auth key)
+#   8) ZeroTier install + join network
+#   9) Install all dependencies now (bootstrap)
+#   10) Show current status
+# Run as root: sudo bash netadmin-menu.sh
+# ============================================================
 
-NETPLAN_FILE="/etc/netplan/01-routeros.yaml"
-STATE_DIR="/var/lib/routeros-menu"
-mkdir -p "$STATE_DIR"
+set -uo pipefail
 
-log(){ echo -e "[$(date +'%F %T')] $*"; }
-need_root(){
-  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "❌ Run as root (use sudo)."
-    exit 1
-  fi
-}
-pause(){ read -r -p "Press Enter to continue... " _; }
+# ---------- helpers ----------
 
-list_ifaces(){
-  ip -o link show | awk -F': ' '{print $2}' | grep -Ev 'lo|docker|veth|br-|tun|tap' || true
-}
-
-backup_netplan(){
-  local bdir="/root/netplan-backup-$(date +%F-%H%M%S)"
-  mkdir -p "$bdir"
-  cp -a /etc/netplan/*.yaml "$bdir" 2>/dev/null || true
-  echo "$bdir" > "$STATE_DIR/last_netplan_backup"
-  log "🗂 Netplan backup saved to: $bdir"
-}
-
-apply_netplan_safe(){
-  log "⚙ netplan generate..."
-  netplan generate
-  log "⚙ netplan apply..."
-  netplan apply
-  log "✅ Netplan applied."
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root. Try: sudo bash $0"
+        exit 1
+    fi
 }
 
-ask_yesno(){
-  local prompt="$1"
-  local ans
-  while true; do
-    read -r -p "$prompt (yes/no): " ans
-    case "${ans,,}" in
-      yes|y) echo "yes"; return ;;
-      no|n)  echo "no";  return ;;
-      *) echo "Please type yes or no." ;;
-    esac
-  done
+pause() {
+    read -rp "Press Enter to continue..." _
 }
 
-# -------------------- 1) NETPLAN --------------------
-netplan_menu(){
-  echo "===================================="
-  echo " Netplan: Multi-Interface Config"
-  echo "===================================="
-  echo "📡 Detected interfaces:"
-  list_ifaces | sed 's/^/ - /'
-  echo
+list_interfaces() {
+    ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$'
+}
 
-  backup_netplan
+pick_interface() {
+    local prompt="$1"
+    echo "Available interfaces:"
+    local ifaces
+    mapfile -t ifaces < <(list_interfaces)
+    local i=1
+    for ifc in "${ifaces[@]}"; do
+        echo "  $i) $ifc"
+        ((i++))
+    done
+    read -rp "$prompt (name or number): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        echo "${ifaces[$((choice-1))]}"
+    else
+        echo "$choice"
+    fi
+}
 
-  cat > "$NETPLAN_FILE" <<EOF
+backup_file() {
+    local f="$1"
+    if [[ -f "$f" && ! -f "${f}.bak.orig" ]]; then
+        cp -a "$f" "${f}.bak.orig"
+    fi
+}
+
+# ---------- 1. Netplan: DHCP or Static ----------
+
+configure_netplan() {
+    echo "=== Configure Netplan interface (DHCP or Static) ==="
+    if ! command -v netplan >/dev/null 2>&1; then
+        echo "netplan not found, installing it first..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y netplan.io
+    fi
+
+    local ifc
+    ifc=$(pick_interface "Interface to configure")
+    if [[ -z "$ifc" ]]; then
+        echo "No interface selected."
+        pause
+        return
+    fi
+
+    read -rp "Mode - (d)hcp or (s)tatic [d]: " mode
+    mode=${mode:-d}
+
+    local ncdir="/etc/netplan"
+    mkdir -p "$ncdir"
+    # remove any earlier config this script wrote for this interface (dhcp or static)
+    rm -f "${ncdir}/99-${ifc}-dhcp.yaml" "${ncdir}/99-${ifc}-static.yaml"
+
+    if [[ "$mode" =~ ^[Ss] ]]; then
+        read -rp "Static address with CIDR (e.g. 192.168.1.50/24): " addr
+        read -rp "Gateway (e.g. 192.168.1.1): " gw
+        read -rp "DNS servers, comma-separated [1.1.1.1,8.8.8.8]: " dnsline
+        dnsline=${dnsline:-1.1.1.1,8.8.8.8}
+
+        if [[ -z "$addr" || -z "$gw" ]]; then
+            echo "Address and gateway are required for static mode."
+            pause
+            return
+        fi
+
+        # turn "1.1.1.1,8.8.8.8" into a yaml list "[1.1.1.1, 8.8.8.8]"
+        local dns_yaml
+        dns_yaml="[$(echo "$dnsline" | sed 's/,/, /g')]"
+
+        local outfile="${ncdir}/99-${ifc}-static.yaml"
+        cat > "$outfile" <<EOF
 network:
   version: 2
   renderer: networkd
   ethernets:
-EOF
-
-  local WAN_DEFINED="no"
-
-  while true; do
-    local add
-    add="$(ask_yesno "➕ Add an interface")"
-    [[ "$add" == "no" ]] && break
-
-    local iface role dhcp
-    read -r -p "Interface name (e.g. eth0): " iface
-    read -r -p "Role (wan/lan/dmz): " role
-    dhcp="$(ask_yesno "Use DHCP on $iface")"
-
-    echo "    Configuring $iface ($role)"
-
-    if [[ "$dhcp" == "yes" ]]; then
-      cat >> "$NETPLAN_FILE" <<EOF
-    $iface:
-      dhcp4: true
-EOF
-      # For WAN via DHCP, we can still set route metric using dhcp4-overrides.
-      if [[ "${role,,}" == "wan" ]]; then
-        if [[ "$WAN_DEFINED" == "yes" ]]; then
-          echo "❌ Only ONE WAN default route allowed in this script."
-          exit 1
-        fi
-        WAN_DEFINED="yes"
-        local metric
-        read -r -p "Route metric for WAN (lower=priority, e.g. 100): " metric
-        cat >> "$NETPLAN_FILE" <<EOF
-      dhcp4-overrides:
-        route-metric: $metric
-EOF
-        echo "$iface" > "$STATE_DIR/wan_iface"
-      fi
-      continue
-    fi
-
-    # Static config
-    local ip dns
-    read -r -p "Static IP (CIDR, e.g. 192.168.10.1/24): " ip
-    read -r -p "DNS servers (comma separated, e.g. 8.8.8.8,1.1.1.1): " dns
-
-    cat >> "$NETPLAN_FILE" <<EOF
-    $iface:
-      addresses:
-        - $ip
-      nameservers:
-        addresses: [${dns//,/\, }]
-EOF
-
-    if [[ "${role,,}" == "wan" ]]; then
-      if [[ "$WAN_DEFINED" == "yes" ]]; then
-        echo "❌ Only ONE WAN default route allowed in this script."
-        exit 1
-      fi
-      WAN_DEFINED="yes"
-
-      local gw metric
-      read -r -p "Gateway IP (WAN): " gw
-      read -r -p "Route metric (lower=priority, e.g. 100): " metric
-
-      cat >> "$NETPLAN_FILE" <<EOF
+    ${ifc}:
+      dhcp4: false
+      addresses: [${addr}]
       routes:
         - to: default
-          via: $gw
-          metric: $metric
+          via: ${gw}
+      nameservers:
+        addresses: ${dns_yaml}
 EOF
-      echo "$iface" > "$STATE_DIR/wan_iface"
+        chmod 600 "$outfile"
+        echo "Wrote $outfile:"
+        cat "$outfile"
     else
-      # For LAN/DMZ, no default gateway (best practice).
-      :
-    fi
-  done
-
-  echo
-  echo "================ GENERATED NETPLAN ================"
-  cat "$NETPLAN_FILE"
-  echo "==================================================="
-  echo
-
-  local apply
-  apply="$(ask_yesno "⚠ Apply netplan now")"
-  if [[ "$apply" == "yes" ]]; then
-    apply_netplan_safe
-  else
-    log "ℹ Not applied. File saved at: $NETPLAN_FILE"
-  fi
-  pause
-}
-
-# -------------------- 2) DHCP SERVER --------------------
-dhcp_setup(){
-  echo "===================================="
-  echo " DHCP Server Setup (isc-dhcp-server)"
-  echo "===================================="
-
-  apt-get update -y
-  apt-get install -y isc-dhcp-server
-
-  echo "📡 Interfaces:"
-  list_ifaces | sed 's/^/ - /'
-  echo
-
-  local iface net mask gw dns rstart rend lease maxlease
-  read -r -p "🔌 LAN interface for DHCP (e.g. eth0): " iface
-  read -r -p "🌐 Network address (e.g. 192.168.10.0): " net
-  read -r -p "📏 Netmask (e.g. 255.255.255.0): " mask
-  read -r -p "🚪 Gateway/router IP for clients (e.g. 192.168.10.1): " gw
-  read -r -p "🧠 DNS for clients (e.g. 8.8.8.8,1.1.1.1): " dns
-  read -r -p "🔢 Range start (e.g. 192.168.10.100): " rstart
-  read -r -p "🔢 Range end (e.g. 192.168.10.200): " rend
-  read -r -p "⏱ Default lease time seconds (e.g. 600): " lease
-  read -r -p "⏱ Max lease time seconds (e.g. 7200): " maxlease
-
-  cp /etc/dhcp/dhcpd.conf /etc/dhcp/dhcpd.conf.bak 2>/dev/null || true
-
-  cat > /etc/dhcp/dhcpd.conf <<EOF
-default-lease-time $lease;
-max-lease-time $maxlease;
-authoritative;
-
-subnet $net netmask $mask {
-  range $rstart $rend;
-  option routers $gw;
-  option subnet-mask $mask;
-  option domain-name-servers ${dns//,/ , };
-}
+        local outfile="${ncdir}/99-${ifc}-dhcp.yaml"
+        cat > "$outfile" <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${ifc}:
+      dhcp4: true
+      dhcp6: false
 EOF
+        chmod 600 "$outfile"
+        echo "Wrote $outfile:"
+        cat "$outfile"
+    fi
 
-  # Set interface
-  if grep -q '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null; then
-    sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"$iface\"/" /etc/default/isc-dhcp-server
-  else
-    echo "INTERFACESv4=\"$iface\"" >> /etc/default/isc-dhcp-server
-  fi
-
-  systemctl enable isc-dhcp-server
-  systemctl restart isc-dhcp-server
-
-  echo "$iface" > "$STATE_DIR/lan_iface"
-  log "✅ DHCP configured on $iface"
-  systemctl --no-pager --full status isc-dhcp-server || true
-  pause
-}
-
-# -------------------- 3) NAT + FORWARD --------------------
-nat_setup(){
-  echo "===================================="
-  echo " NAT + Forwarding (iptables MASQUERADE)"
-  echo "===================================="
-
-  apt-get update -y
-  apt-get install -y iptables iptables-persistent
-
-  echo "📡 Interfaces:"
-  list_ifaces | sed 's/^/ - /'
-  echo
-
-  local wan lan
-  read -r -p "🌐 WAN interface (internet/upstream, e.g. eth1): " wan
-  read -r -p "🏠 LAN interface (clients side, e.g. eth0): " lan
-
-  # Enable forwarding runtime
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  # Persist forwarding
-  if grep -q '^#\?net.ipv4.ip_forward=' /etc/sysctl.conf; then
-    sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-  else
-    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-  fi
-
-  # Baseline rules (keeps it simple)
-  iptables -F
-  iptables -t nat -F
-
-  iptables -t nat -A POSTROUTING -o "$wan" -j MASQUERADE
-  iptables -A FORWARD -i "$lan" -o "$wan" -j ACCEPT
-  iptables -A FORWARD -i "$wan" -o "$lan" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
-  iptables-save > /etc/iptables/rules.v4
-
-  echo "$wan" > "$STATE_DIR/wan_iface"
-  echo "$lan" > "$STATE_DIR/lan_iface"
-
-  log "✅ NAT configured: LAN=$lan -> WAN=$wan"
-  echo
-  echo "NAT table:"
-  iptables -t nat -L -v
-  echo
-  echo "FORWARD chain:"
-  iptables -L FORWARD -v
-  pause
-}
-
-# -------------------- 4) SSH HARDENING --------------------
-ssh_hardening(){
-  echo "===================================="
-  echo " SSH Hardening"
-  echo "===================================="
-
-  apt-get update -y
-  apt-get install -y openssh-server
-
-  local change_port dis_root dis_pass ssh_port
-  change_port="$(ask_yesno "Change SSH port")"
-  if [[ "$change_port" == "yes" ]]; then
-    read -r -p "New SSH port (e.g. 2222): " ssh_port
-  else
-    ssh_port="22"
-  fi
-
-  dis_root="$(ask_yesno "Disable root login")"
-  dis_pass="$(ask_yesno "Disable password login (keys only)")"
-
-  local conf="/etc/ssh/sshd_config"
-  cp "$conf" "${conf}.bak.$(date +%F-%H%M%S)" 2>/dev/null || true
-
-  # Set/replace directives (append if missing)
-  set_sshd(){
-    local key="$1" val="$2"
-    if grep -qiE "^[#\s]*${key}\b" "$conf"; then
-      sed -i -E "s/^[#\s]*${key}\b.*/${key} ${val}/I" "$conf"
+    echo
+    read -rp "Apply this netplan config now? (y/N): " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        netplan generate && netplan apply
+        echo "Applied. Current addressing for $ifc:"
+        ip addr show "$ifc"
     else
-      echo "${key} ${val}" >> "$conf"
+        echo "Not applied. Run 'sudo netplan apply' manually when ready."
     fi
-  }
-
-  set_sshd "Port" "$ssh_port"
-  [[ "$dis_root" == "yes" ]] && set_sshd "PermitRootLogin" "no"
-  if [[ "$dis_pass" == "yes" ]]; then
-    set_sshd "PasswordAuthentication" "no"
-    set_sshd "KbdInteractiveAuthentication" "no"
-    set_sshd "ChallengeResponseAuthentication" "no"
-    set_sshd "PubkeyAuthentication" "yes"
-  fi
-
-  # Validate before restart
-  if sshd -t; then
-    systemctl restart ssh
-    echo "$ssh_port" > "$STATE_DIR/ssh_port"
-    log "✅ SSH hardened. Port: $ssh_port"
-  else
-    echo "❌ sshd_config test failed. Restoring last backup is recommended."
-  fi
-
-  echo "⚠ Make sure you have key access before closing your current session."
-  pause
+    pause
 }
 
-# -------------------- 5) UFW FIREWALL --------------------
-ufw_setup(){
-  echo "===================================="
-  echo " UFW Firewall (Gateway Baseline)"
-  echo "===================================="
-  apt-get update -y
-  apt-get install -y ufw
+# ---------- 2. IP forwarding + NAT ----------
 
-  local ssh_port="22"
-  [[ -f "$STATE_DIR/ssh_port" ]] && ssh_port="$(cat "$STATE_DIR/ssh_port")" || true
+configure_forwarding() {
+    echo "=== Enable IP forwarding + NAT (Internet -> LAN) ==="
+    local wan lan
+    wan=$(pick_interface "WAN interface (has internet)")
+    lan=$(pick_interface "LAN interface (serves local clients)")
 
-  local wan="" lan=""
-  [[ -f "$STATE_DIR/wan_iface" ]] && wan="$(cat "$STATE_DIR/wan_iface")" || true
-  [[ -f "$STATE_DIR/lan_iface" ]] && lan="$(cat "$STATE_DIR/lan_iface")" || true
+    if [[ -z "$wan" || -z "$lan" ]]; then
+        echo "Both interfaces are required."
+        pause
+        return
+    fi
 
-  echo "Detected: SSH port=$ssh_port  WAN=${wan:-unknown}  LAN=${lan:-unknown}"
-  echo
-
-  # Reset & set defaults
-  ufw --force reset
-  ufw default deny incoming
-  ufw default allow outgoing
-
-  # Allow SSH
-  ufw allow "$ssh_port"/tcp
-
-  # Allow DHCP server replies on LAN (server side)
-  # If you're running DHCP on this box, clients need UDP 67/68 on LAN.
-  if [[ -n "$lan" ]]; then
-    ufw allow in on "$lan" to any port 67 proto udp
-    ufw allow in on "$lan" to any port 68 proto udp
-  fi
-
-  # Enable forwarding policy (needed for router)
-  # NOTE: UFW needs DEFAULT_FORWARD_POLICY="ACCEPT"
-  if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
-    sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-  else
-    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
-  fi
-
-  # Allow forwarding LAN->WAN (basic)
-  if [[ -n "$lan" && -n "$wan" ]]; then
-    local before="/etc/ufw/before.rules"
-    cp "$before" "${before}.bak.$(date +%F-%H%M%S)" 2>/dev/null || true
-
-    # Add NAT to before.rules if not present (UFW NAT)
-    if ! grep -q "ROUTEROS_NAT_BEGIN" "$before"; then
-      cat >> "$before" <<EOF
-
-# ROUTEROS_NAT_BEGIN
-*nat
-:POSTROUTING ACCEPT [0:0]
--A POSTROUTING -o $wan -j MASQUERADE
-COMMIT
-# ROUTEROS_NAT_END
+    # Persist sysctl ip_forward
+    local sysctl_file="/etc/sysctl.d/99-ipforward.conf"
+    cat > "$sysctl_file" <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
 EOF
+    sysctl -p "$sysctl_file"
+
+    # Install iptables-persistent (or nftables) if missing, non-interactively
+    if ! command -v iptables >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
     fi
-  fi
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+        echo "iptables-persistent netfilter-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+        echo "iptables-persistent netfilter-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+    fi
 
-  ufw --force enable
-  ufw status verbose
-  log "✅ UFW configured."
-  pause
-}
+    # NAT + forwarding rules
+    iptables -t nat -C POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$wan" -j MASQUERADE
 
-# -------------------- 6) STATUS --------------------
-show_status(){
-  echo "===================================="
-  echo " STATUS"
-  echo "===================================="
-  echo "Interfaces:"
-  ip -br a || true
-  echo
-  echo "Routes:"
-  ip route || true
-  echo
-  echo "IP Forwarding:"
-  sysctl net.ipv4.ip_forward || true
-  echo
-  echo "DHCP Service:"
-  systemctl --no-pager --full status isc-dhcp-server || true
-  echo
-  echo "SSH Service:"
-  systemctl --no-pager --full status ssh || true
-  echo
-  echo "iptables NAT:"
-  iptables -t nat -L -v || true
-  echo
-  echo "UFW:"
-  ufw status verbose || true
-  echo
-  echo "Netplan file:"
-  [[ -f "$NETPLAN_FILE" ]] && cat "$NETPLAN_FILE" || echo "(not found: $NETPLAN_FILE)"
-  pause
-}
+    iptables -C FORWARD -i "$wan" -o "$lan" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$wan" -o "$lan" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-# -------------------- 7) NETPLAN ROLLBACK --------------------
-netplan_rollback(){
-  echo "===================================="
-  echo " Netplan Rollback"
-  echo "===================================="
-  if [[ ! -f "$STATE_DIR/last_netplan_backup" ]]; then
-    echo "❌ No backup recorded."
+    iptables -C FORWARD -i "$lan" -o "$wan" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$lan" -o "$wan" -j ACCEPT
+
+    netfilter-persistent save >/dev/null 2>&1 || true
+
+    echo "Done. WAN=$wan LAN=$lan"
+    echo "  - ip_forward persisted in $sysctl_file"
+    echo "  - NAT/forward rules added and saved (iptables-persistent)"
+    echo
+    echo "Note: give $lan a static address of its own (netplan option 1, static mode),"
+    echo "then use option 4 (isc-dhcp-server) if LAN clients need addresses handed out."
     pause
-    return
-  fi
-  local bdir
-  bdir="$(cat "$STATE_DIR/last_netplan_backup")"
-  if [[ ! -d "$bdir" ]]; then
-    echo "❌ Backup folder missing: $bdir"
-    pause
-    return
-  fi
-
-  local ok
-  ok="$(ask_yesno "Restore netplan YAMLs from $bdir and apply")"
-  if [[ "$ok" == "yes" ]]; then
-    rm -f /etc/netplan/*.yaml 2>/dev/null || true
-    cp -a "$bdir"/*.yaml /etc/netplan/ 2>/dev/null || true
-    apply_netplan_safe
-    log "✅ Netplan rolled back."
-  else
-    echo "Canceled."
-  fi
-  pause
 }
 
-# -------------------- MAIN MENU --------------------
-main_menu(){
-  need_root
-  while true; do
-    clear
-    echo "=============================="
-    echo "   Ubuntu Router OS (Menu)    "
-    echo "=============================="
-    echo "1) Configure Netplan (multi-iface, WAN metric)"
-    echo "2) Setup DHCP Server"
-    echo "3) Setup NAT + Forwarding"
-    echo "4) SSH Hardening"
-    echo "5) Setup UFW Firewall (gateway baseline)"
-    echo "6) Show Status"
-    echo "7) Rollback Netplan"
-    echo "0) Exit"
-    echo "------------------------------"
-    read -r -p "Choose: " choice
-    case "$choice" in
-      1) netplan_menu ;;
-      2) dhcp_setup ;;
-      3) nat_setup ;;
-      4) ssh_hardening ;;
-      5) ufw_setup ;;
-      6) show_status ;;
-      7) netplan_rollback ;;
-      0) exit 0 ;;
-      *) echo "Invalid choice"; pause ;;
-    esac
-  done
+# ---------- 3. SSH fully open (password auth, no key required) ----------
+
+configure_ssh_open() {
+    echo "=== Configure SSH for password login (no key required) ==="
+    echo "WARNING: this makes SSH accept any valid system account password,"
+    echo "including root if enabled. Fine for a lab/homelab, risky on the open"
+    echo "internet -- make sure the box is firewalled or on a private network."
+    read -rp "Continue? (y/N): " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        pause
+        return
+    fi
+
+    if ! command -v sshd >/dev/null 2>&1; then
+        echo "openssh-server not found, installing it first..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+        systemctl enable --now ssh
+    fi
+
+    local sshd_config="/etc/ssh/sshd_config"
+    backup_file "$sshd_config"
+
+    set_sshd_option() {
+        local key="$1" val="$2"
+        if grep -qE "^[#[:space:]]*${key}\b" "$sshd_config"; then
+            sed -i -E "s|^[#[:space:]]*${key}\b.*|${key} ${val}|" "$sshd_config"
+        else
+            echo "${key} ${val}" >> "$sshd_config"
+        fi
+    }
+
+    set_sshd_option "PasswordAuthentication" "yes"
+    set_sshd_option "PubkeyAuthentication" "yes"
+    set_sshd_option "PermitRootLogin" "yes"
+    set_sshd_option "ChallengeResponseAuthentication" "no"
+    set_sshd_option "UsePAM" "yes"
+
+    # Pre-login banner
+    local banner_file="/etc/issue.net"
+    cat > "$banner_file" <<'EOF'
+############################################################
+   ITS The1 Solutions
+   Authorized access only. All activity may be monitored
+   and logged. Disconnect immediately if you are not an
+   authorized user.
+############################################################
+EOF
+    set_sshd_option "Banner" "$banner_file"
+
+    # Drop any Include snippet that forces key-only auth (Ubuntu cloud images)
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -e "$f" ]] || continue
+            sed -i -E 's|^[#[:space:]]*PasswordAuthentication.*|PasswordAuthentication yes|' "$f"
+        done
+    fi
+
+    sshd -t && systemctl restart ssh
+    echo "SSH now accepts password authentication (config test passed, service restarted)."
+    echo "Banner set to $banner_file (ITS The1 Solutions)."
+    echo "Backup of original sshd_config saved as ${sshd_config}.bak.orig"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1
+        echo "ufw: allowed SSH (22/tcp)."
+    fi
+    pause
+}
+
+# ---------- 4. LAN DHCP server (isc-dhcp-server) ----------
+
+configure_lan_dhcp() {
+    echo "=== LAN DHCP server (isc-dhcp-server) ==="
+    local ifc
+    ifc=$(pick_interface "LAN interface to serve DHCP on")
+    if [[ -z "$ifc" ]]; then
+        echo "No interface selected."
+        pause
+        return
+    fi
+
+    local my_ip
+    my_ip=$(ip -4 -o addr show "$ifc" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    if [[ -z "$my_ip" ]]; then
+        echo "Interface $ifc has no IPv4 address yet. Give it a static address first"
+        echo "(netplan option 1, static mode) before running a DHCP server on it."
+        pause
+        return
+    fi
+
+    echo "$ifc currently has $my_ip. This will be offered as gateway/DNS unless you override it."
+    read -rp "Network address (e.g. 192.168.50.0): " network
+    read -rp "Netmask [255.255.255.0]: " netmask
+    netmask=${netmask:-255.255.255.0}
+    read -rp "DHCP range start (e.g. 192.168.50.100): " range_start
+    read -rp "DHCP range end   (e.g. 192.168.50.200): " range_end
+    read -rp "Gateway to hand out [$my_ip]: " gateway
+    gateway=${gateway:-$my_ip}
+    read -rp "DNS server(s) to hand out, comma-separated [$my_ip]: " dns
+    dns=${dns:-$my_ip}
+    read -rp "Default/max lease time in seconds [43200 = 12h]: " lease
+    lease=${lease:-43200}
+
+    if [[ -z "$network" || -z "$range_start" || -z "$range_end" ]]; then
+        echo "Network address and range start/end are required."
+        pause
+        return
+    fi
+
+    if ! command -v dhcpd >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y isc-dhcp-server
+    fi
+
+    # dhcpd.conf has no wildcard include, so add an explicit include line
+    # for this interface's subnet file if it isn't already referenced.
+    local dhcpd_conf="/etc/dhcp/dhcpd.conf"
+    backup_file "$dhcpd_conf"
+    mkdir -p /etc/dhcp/dhcpd.conf.d
+    if ! grep -qF "dhcpd.conf.d/${ifc}.conf" "$dhcpd_conf" 2>/dev/null; then
+        echo "include \"/etc/dhcp/dhcpd.conf.d/${ifc}.conf\";" >> "$dhcpd_conf"
+    fi
+
+    local subnet_conf="/etc/dhcp/dhcpd.conf.d/${ifc}.conf"
+    local dns_line
+    dns_line=$(echo "$dns" | sed 's/,/, /g')
+
+    cat > "$subnet_conf" <<EOF
+default-lease-time ${lease};
+max-lease-time ${lease};
+
+subnet ${network} netmask ${netmask} {
+    range ${range_start} ${range_end};
+    option routers ${gateway};
+    option domain-name-servers ${dns_line};
+}
+EOF
+
+    # Tell isc-dhcp-server which interface to listen on
+    local defaults_file="/etc/default/isc-dhcp-server"
+    backup_file "$defaults_file"
+    if grep -q '^INTERFACESv4=' "$defaults_file" 2>/dev/null; then
+        local current
+        current=$(grep '^INTERFACESv4=' "$defaults_file" | sed -E 's/INTERFACESv4="?([^"]*)"?/\1/')
+        if [[ ",$current," != *",$ifc,"* ]]; then
+            local merged
+            merged=$(echo "$current $ifc" | xargs)
+            sed -i -E "s|^INTERFACESv4=.*|INTERFACESv4=\"${merged}\"|" "$defaults_file"
+        fi
+    else
+        echo "INTERFACESv4=\"${ifc}\"" >> "$defaults_file"
+    fi
+
+    dhcpd -t -cf "$dhcpd_conf" 2>&1 | tail -n 5
+    systemctl enable isc-dhcp-server >/dev/null 2>&1
+    systemctl restart isc-dhcp-server
+
+    echo "Wrote $subnet_conf:"
+    cat "$subnet_conf"
+    echo
+    systemctl is-active isc-dhcp-server && echo "isc-dhcp-server restarted and enabled on boot."
+    pause
+}
+
+# ---------- 5. UFW firewall + fail2ban ----------
+
+configure_ufw_fail2ban() {
+    echo "=== UFW firewall + fail2ban ==="
+    if ! command -v ufw >/dev/null 2>&1 || ! command -v fail2ban-client >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ufw fail2ban
+    fi
+
+    # Keep forwarding working through ufw for the NAT setup in option 2
+    sed -i -E 's|^DEFAULT_FORWARD_POLICY=.*|DEFAULT_FORWARD_POLICY="ACCEPT"|' /etc/default/ufw 2>/dev/null || true
+
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp
+
+    read -rp "Any extra ports to allow now? (comma-separated, e.g. 80,443,8080/tcp) [skip]: " extra
+    if [[ -n "$extra" ]]; then
+        IFS=',' read -ra ports <<< "$extra"
+        for p in "${ports[@]}"; do
+            p="${p// /}"
+            [[ -n "$p" ]] && ufw allow "$p"
+        done
+    fi
+
+    ufw --force enable
+
+    # fail2ban: make sure the sshd jail is on
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port    = ssh
+backend = systemd
+maxretry = 5
+bantime  = 1h
+findtime = 10m
+EOF
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban
+
+    echo
+    echo "ufw status:"
+    ufw status verbose
+    echo
+    echo "fail2ban sshd jail status:"
+    fail2ban-client status sshd 2>/dev/null
+    pause
+}
+
+# ---------- 6. Port-forward / DNAT helper ----------
+
+configure_port_forward() {
+    echo "=== Port-forward / DNAT (expose an internal host:port via WAN) ==="
+    local wan
+    wan=$(pick_interface "WAN interface (public-facing)")
+    if [[ -z "$wan" ]]; then
+        echo "No interface selected."
+        pause
+        return
+    fi
+
+    read -rp "Protocol (tcp/udp) [tcp]: " proto
+    proto=${proto:-tcp}
+    read -rp "External port on $wan: " ext_port
+    read -rp "Internal LAN host IP: " int_ip
+    read -rp "Internal port [same as external]: " int_port
+    int_port=${int_port:-$ext_port}
+
+    if [[ -z "$ext_port" || -z "$int_ip" ]]; then
+        echo "External port and internal IP are required."
+        pause
+        return
+    fi
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+    fi
+
+    iptables -t nat -C PREROUTING -i "$wan" -p "$proto" --dport "$ext_port" \
+        -j DNAT --to-destination "${int_ip}:${int_port}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$wan" -p "$proto" --dport "$ext_port" \
+        -j DNAT --to-destination "${int_ip}:${int_port}"
+
+    iptables -C FORWARD -p "$proto" -d "$int_ip" --dport "$int_port" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -p "$proto" -d "$int_ip" --dport "$int_port" -j ACCEPT
+
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+
+    echo "Forwarding ${wan}:${ext_port}/${proto} -> ${int_ip}:${int_port}"
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        ufw allow "${ext_port}/${proto}" >/dev/null 2>&1
+        echo "ufw: also allowed ${ext_port}/${proto}."
+    fi
+    pause
+}
+
+# ---------- 7. Tailscale (own auth key) ----------
+
+configure_tailscale() {
+    echo "=== Tailscale install + connect ==="
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "Installing Tailscale..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    else
+        echo "Tailscale already installed: $(tailscale version | head -n1)"
+    fi
+
+    systemctl enable --now tailscaled >/dev/null 2>&1
+
+    read -rsp "Paste your Tailscale auth key (input hidden): " authkey
+    echo
+    if [[ -z "$authkey" ]]; then
+        echo "No key entered, cancelling."
+        pause
+        return
+    fi
+
+    read -rp "Advertise this box as an exit node/subnet router? (y/N): " adv
+    if [[ "$adv" =~ ^[Yy]$ ]]; then
+        read -rp "Subnet(s) to advertise, comma-separated (blank for none): " routes
+        if [[ -n "$routes" ]]; then
+            tailscale up --authkey="$authkey" --advertise-routes="$routes" --accept-dns=false
+        else
+            tailscale up --authkey="$authkey" --advertise-exit-node --accept-dns=false
+        fi
+    else
+        tailscale up --authkey="$authkey" --accept-dns=false
+    fi
+
+    unset authkey
+    echo
+    echo "Tailscale status:"
+    tailscale status
+    pause
+}
+
+# ---------- 8. ZeroTier (install + join network) ----------
+
+configure_zerotier() {
+    echo "=== ZeroTier install + join network ==="
+    if ! command -v zerotier-cli >/dev/null 2>&1; then
+        echo "Installing ZeroTier..."
+        curl -s https://install.zerotier.com | bash
+    else
+        echo "ZeroTier already installed: $(zerotier-cli -v 2>/dev/null)"
+    fi
+
+    systemctl enable --now zerotier-one >/dev/null 2>&1
+
+    read -rp "ZeroTier Network ID to join: " netid
+    if [[ -z "$netid" ]]; then
+        echo "No network ID entered, cancelling."
+        pause
+        return
+    fi
+
+    zerotier-cli join "$netid"
+
+    echo
+    echo "Joined. This device now needs to be authorized in the ZeroTier Central"
+    echo "console (my.zerotier.com) for that network before traffic will flow."
+    echo
+    echo "ZeroTier status:"
+    zerotier-cli info
+    zerotier-cli listnetworks
+    pause
+}
+
+# ---------- 10. Install all dependencies up front ----------
+
+install_all_deps() {
+    echo "=== Install all dependencies used by this menu ==="
+    echo "This will apt-get install (if missing): netplan.io, openssh-server,"
+    echo "iptables, iptables-persistent, isc-dhcp-server, ufw, fail2ban,"
+    echo "and install Tailscale + ZeroTier via their official scripts."
+    read -rp "Continue? (y/N): " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        pause
+        return
+    fi
+
+    echo "Updating package index..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+
+    local pkgs=(netplan.io openssh-server iptables isc-dhcp-server ufw fail2ban)
+    for p in "${pkgs[@]}"; do
+        if dpkg -s "$p" >/dev/null 2>&1; then
+            echo "[skip] $p already installed"
+        else
+            echo "[install] $p"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$p"
+        fi
+    done
+
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+        echo "[install] iptables-persistent"
+        echo "iptables-persistent netfilter-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+        echo "iptables-persistent netfilter-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+    else
+        echo "[skip] iptables-persistent already installed"
+    fi
+
+    systemctl enable --now ssh >/dev/null 2>&1
+
+    if command -v tailscale >/dev/null 2>&1; then
+        echo "[skip] tailscale already installed"
+    else
+        echo "[install] tailscale"
+        curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+    systemctl enable --now tailscaled >/dev/null 2>&1
+
+    if command -v zerotier-cli >/dev/null 2>&1; then
+        echo "[skip] zerotier already installed"
+    else
+        echo "[install] zerotier"
+        curl -s https://install.zerotier.com | bash
+    fi
+    systemctl enable --now zerotier-one >/dev/null 2>&1
+
+    echo
+    echo "All dependencies checked/installed. You can now use any menu option"
+    echo "without waiting on a package install mid-task."
+    pause
+}
+
+# ---------- 11. Status ----------
+
+show_status() {
+    echo "=== Current status ==="
+    echo "--- Interfaces & addresses ---"
+    ip -brief addr show
+    echo
+    echo "--- IP forwarding ---"
+    echo "ipv4: $(cat /proc/sys/net/ipv4/ip_forward)"
+    echo
+    echo "--- NAT / forward rules ---"
+    iptables -t nat -L POSTROUTING -n -v 2>/dev/null
+    echo
+    iptables -L FORWARD -n -v 2>/dev/null
+    echo
+    echo "--- SSH auth settings ---"
+    grep -E "^(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication)" /etc/ssh/sshd_config 2>/dev/null
+    echo
+    systemctl is-active ssh 2>/dev/null && echo "ssh service: active"
+    echo
+    echo "--- isc-dhcp-server ---"
+    systemctl is-active isc-dhcp-server 2>/dev/null && ls /etc/dhcp/dhcpd.conf.d/*.conf 2>/dev/null
+    echo
+    echo "--- ufw ---"
+    command -v ufw >/dev/null 2>&1 && ufw status
+    echo
+    echo "--- fail2ban ---"
+    command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd 2>/dev/null
+    echo
+    echo "--- tailscale ---"
+    command -v tailscale >/dev/null 2>&1 && tailscale status 2>/dev/null
+    echo
+    echo "--- zerotier ---"
+    command -v zerotier-cli >/dev/null 2>&1 && zerotier-cli listnetworks 2>/dev/null
+    pause
+}
+
+# ---------- main menu ----------
+
+main_menu() {
+    require_root
+    while true; do
+        clear
+        cat <<'MENU'
+============================================
+ Ubuntu Net Admin Menu
+============================================
+ 1) Netplan: set interface to DHCP or Static
+ 2) Enable IP forwarding + NAT (share internet to LAN)
+ 3) Open SSH (password login, no key required, ITS The1 Solutions banner)
+ 4) LAN DHCP server (isc-dhcp-server)
+ 5) UFW firewall + fail2ban
+ 6) Port-forward / DNAT helper
+ 7) Tailscale install + connect (own auth key)
+ 8) ZeroTier install + join network
+ 9) Install all dependencies now (bootstrap)
+ 10) Show status
+ 11) Exit
+============================================
+MENU
+        read -rp "Choose an option [1-11]: " opt
+        case "$opt" in
+            1) configure_netplan ;;
+            2) configure_forwarding ;;
+            3) configure_ssh_open ;;
+            4) configure_lan_dhcp ;;
+            5) configure_ufw_fail2ban ;;
+            6) configure_port_forward ;;
+            7) configure_tailscale ;;
+            8) configure_zerotier ;;
+            9) install_all_deps ;;
+            10) show_status ;;
+            11) exit 0 ;;
+            *) echo "Invalid choice."; pause ;;
+        esac
+    done
 }
 
 main_menu
